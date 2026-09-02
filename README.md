@@ -16,7 +16,7 @@ pip install numpy librosa soundfile scipy tabulate
 Run the script without flags to be prompted for inputs:
 
 ```bash
-python sdr_evaluator.py
+python eval.py
 ```
 
 ### Command-Line Arguments
@@ -34,12 +34,12 @@ python sdr_evaluator.py
 
 **Evaluate a single stem with detailed chunk breakdown:**
 ```bash
-python sdr_evaluator.py -g "ref.wav" -a "stem.wav" -v
+python eval.py -g "ref.wav" -a "stem.wav" -v
 ```
 
 **Batch evaluate a folder of stems with custom chunk size and CSV export:**
 ```bash
-python sdr_evaluator.py -g "ref.flac" -a "./stems_folder/" --chunk-size 5.0 --csv "report.csv"
+python eval.py -g "ref.flac" -a "./stems_folder/" --chunk-size 5.0 --csv "report.csv"
 ```
 
 ## Additional Notes
