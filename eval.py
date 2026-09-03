@@ -1,94 +1,100 @@
-import os
 import argparse
+import csv
+import os
+import time
 import numpy as np
 import librosa
 import soundfile as sf
 from scipy.signal import correlate
 from tabulate import tabulate
-import csv
+
+try:
+    import museval
+except ImportError:
+    museval = None
 
 VALID_EXTENSIONS = ('.wav', '.flac', '.mp3', '.m4a')
 
 
 # -----------------------------------------------------------------------------
-# Path Sanitization & Validation
+# Helpers & I/O
 # -----------------------------------------------------------------------------
 
 def sanitize_path(path: str) -> str:
-    """Removes outer quotes, extra spaces, and hidden drag-and-drop artifacts."""
-    if not path:
-        return ""
-    return path.strip('"' + "'" + ' ')
+    """Removes quotes, whitespace, and drag-and-drop artifacts."""
+    return path.strip('"' + "'" + ' ') if path else ""
 
 
 def validate_file(path: str) -> bool:
-    """Check if file exists and has a supported extension."""
+    """Validates existence and format of audio files."""
     clean_path = sanitize_path(path)
     if not os.path.isfile(clean_path):
         print(f"[Error] File not found: {clean_path}")
         return False
     if not clean_path.lower().endswith(VALID_EXTENSIONS):
-        print(f"[Error] Unsupported file format for: {clean_path}")
+        print(f"[Error] Unsupported format: {clean_path}")
         return False
     return True
 
 
-# -----------------------------------------------------------------------------
-# 1. Input Processing & Normalization
-# -----------------------------------------------------------------------------
+def load_audio(path: str, target_sr: int = None, verbose: bool = False):
+    """Loads audio file and standardizes shape to stereo (2, samples)."""
+    clean_path = sanitize_path(path)
+    if verbose:
+        print(f"   [IO] Reading audio info for: {os.path.basename(clean_path)}")
+        
+    if target_sr is None:
+        target_sr = sf.info(clean_path).samplerate
 
-def load_and_normalize(ref_path: str, test_path: str):
-    ref_path = sanitize_path(ref_path)
-    test_path = sanitize_path(test_path)
+    if verbose:
+        print(f"   [IO] Loading waveform (Sample Rate: {target_sr} Hz)...")
+        
+    start_time = time.time()
+    audio, sr = librosa.load(clean_path, sr=target_sr, mono=False)
+    load_duration = time.time() - start_time
 
-    ref_info = sf.info(ref_path)
-    target_sr = ref_info.samplerate
+    if audio.ndim == 1:
+        if verbose:
+            print("   [IO] Mono audio detected. Converting to pseudo-stereo.")
+        audio = np.stack([audio, audio])
 
-    ref_audio, _ = librosa.load(ref_path, sr=target_sr, mono=False)
-    test_audio, _ = librosa.load(test_path, sr=target_sr, mono=False)
+    if verbose:
+        print(f"   [IO] Audio loaded in {load_duration:.2f}s | Shape: {audio.shape} ({audio.shape[1] / sr:.2f} seconds)")
 
-    if ref_audio.ndim == 1:
-        ref_audio = np.stack([ref_audio, ref_audio])
-    if test_audio.ndim == 1:
-        test_audio = np.stack([test_audio, test_audio])
-
-    min_len = min(ref_audio.shape[1], test_audio.shape[1])
-    ref_audio = ref_audio[:, :min_len]
-    test_audio = test_audio[:, :min_len]
-
-    return ref_audio, test_audio, target_sr
+    return audio, sr
 
 
-# -----------------------------------------------------------------------------
-# 2. Temporal Alignment
-# -----------------------------------------------------------------------------
-
-def align_signals(ref_channel: np.ndarray, test_channel: np.ndarray, max_shift_samples: int = 44100):
+def align_signals(ref_channel: np.ndarray, test_channel: np.ndarray, max_shift_samples: int = 44100, verbose: bool = False):
+    """Aligns test channel signal with reference channel based on cross-correlation."""
+    if verbose:
+        print("   [Align] Computing cross-correlation for temporal alignment...")
+        
+    start_time = time.time()
     search_len = min(len(ref_channel), max_shift_samples)
-    ref_slice = ref_channel[:search_len]
-    test_slice = test_channel[:search_len]
+    corr = correlate(ref_channel[:search_len], test_channel[:search_len], mode='full')
+    delay = corr.argmax() - (search_len - 1)
+    align_duration = time.time() - start_time
 
-    corr = correlate(ref_slice, test_slice, mode='full')
-    delay = corr.argmax() - (len(test_slice) - 1)
+    if verbose:
+        delay_ms = (delay / max_shift_samples) * 1000
+        print(f"   [Align] Alignment calculated in {align_duration:.2f}s | Shift delay: {delay} samples ({delay_ms:.2f} ms)")
 
     if delay > 0:
-        test_aligned = np.pad(test_channel, (delay, 0))[:len(test_channel)]
+        return np.pad(test_channel, (delay, 0))[:len(test_channel)], delay
     elif delay < 0:
-        test_aligned = test_channel[-delay:]
-        test_aligned = np.pad(test_aligned, (0, -delay))[:len(test_channel)]
-    else:
-        test_aligned = test_channel
-
-    return test_aligned, delay
+        aligned = np.pad(test_channel[-delay:], (0, -delay))[:len(test_channel)]
+        return aligned, delay
+    
+    return test_channel, 0
 
 
 # -----------------------------------------------------------------------------
-# 3. Mathematical SDR Engine
+# Evaluation Engines
 # -----------------------------------------------------------------------------
 
 def compute_sdr(ref_seg: np.ndarray, test_seg: np.ndarray, eps: float = 1e-7) -> float:
+    """Computes mathematical SDR for single-channel signal segments."""
     ref_energy = np.sum(ref_seg ** 2)
-
     if ref_energy < eps:
         return np.nan
 
@@ -100,179 +106,247 @@ def compute_sdr(ref_seg: np.ndarray, test_seg: np.ndarray, eps: float = 1e-7) ->
     noise = ref_seg - (alpha * test_seg)
     noise_energy = np.sum(noise ** 2)
 
-    if noise_energy < eps:
-        return 100.0
+    return 100.0 if noise_energy < eps else float(10 * np.log10(ref_energy / noise_energy))
 
-    sdr = 10 * np.log10(ref_energy / noise_energy)
-    return float(sdr)
+
+def compute_museval_fast(ref_audio: np.ndarray, test_audio: np.ndarray, sr: int, win_sec: float = 1.0, hop_sec: float = 1.0, verbose: bool = False) -> dict:
+    """Evaluates full track using correctly-scaled sample parameters in Museval."""
+    if museval is None:
+        raise RuntimeError("Museval is not installed. Run: pip install museval")
+
+    # Shape conversion: (channels, samples) -> (sources, samples, channels)
+    references = ref_audio.T[np.newaxis, :, :]
+    estimates = test_audio.T[np.newaxis, :, :]
+
+    # Convert window and hop from SECONDS to SAMPLES
+    win_samples = int(win_sec * sr)
+    hop_samples = int(hop_sec * sr)
+
+    if verbose:
+        print(f"   [Museval] Initializing BSS Eval engine...")
+        print(f"   [Museval] Frame config -> Window: {win_sec}s ({win_samples} samples) | Hop: {hop_sec}s ({hop_samples} samples)")
+        print(f"   [Museval] Input matrix shape: {references.shape}")
+        print(f"   [Museval] Running evaluation algorithms (SDR, ISR, SAR)...")
+
+    start_time = time.time()
+
+    try:
+        sdr, isr, _, sar = museval.evaluate(
+            references,
+            estimates,
+            win=win_samples,
+            hop=hop_samples,
+            padding=True
+        )
+
+        eval_duration = time.time() - start_time
+        if verbose:
+            print(f"   [Museval] Computation completed in {eval_duration:.2f} seconds.")
+
+        def avg(arr):
+            v = np.asarray(arr, dtype=float)
+            v = v[np.isfinite(v)]
+            return float(np.mean(v)) if v.size else np.nan
+
+        metrics = {"sdr": avg(sdr[0]), "isr": avg(isr[0]), "sar": avg(sar[0])}
+
+        if verbose:
+            print(f"   [Museval] Computed metrics: SDR={metrics['sdr']:.2f} dB | ISR={metrics['isr']:.2f} dB | SAR={metrics['sar']:.2f} dB")
+
+        return metrics
+
+    except Exception as exc:
+        print(f"[Warning] Museval evaluation failed: {exc}")
+        return {"sdr": np.nan, "isr": np.nan, "sar": np.nan}
 
 
 # -----------------------------------------------------------------------------
-# 4. Chunked Evaluation System
+# Core Batch Pipeline
 # -----------------------------------------------------------------------------
 
-def evaluate_track(ref_path: str, test_path: str, chunk_duration: float = 10.0, align: bool = True):
-    ref, test, sr = load_and_normalize(ref_path, test_path)
+def evaluate_track(ref_audio: np.ndarray, test_path: str, sr: int, chunk_sec: float = 10.0, align: bool = True, use_museval: bool = False, verbose: bool = False):
+    """Processes evaluation for a single track pair."""
+    file_name = os.path.basename(test_path)
+    if verbose:
+        print(f"\n--- Processing Track: {file_name} ---")
+
+    test_audio, _ = load_audio(test_path, target_sr=sr, verbose=verbose)
+    
+    # Match audio track lengths
+    min_len = min(ref_audio.shape[1], test_audio.shape[1])
+    if verbose:
+        print(f"   [Prep] Trimming tracks to matching length: {min_len} samples ({min_len / sr:.2f}s)")
+        
+    ref = ref_audio[:, :min_len]
+    test = test_audio[:, :min_len]
 
     if align:
-        _, delay = align_signals(ref[0], test[0], max_shift_samples=sr)
-        if delay != 0:
-            for ch in range(test.shape[0]):
-                test[ch], _ = align_signals(ref[ch], test[ch], max_shift_samples=sr)
+        for ch in range(test.shape[0]):
+            if verbose:
+                print(f"   [Prep] Channel {ch + 1} Alignment:")
+            test[ch], _ = align_signals(ref[ch], test[ch], max_shift_samples=sr, verbose=verbose)
 
-    chunk_samples = int(chunk_duration * sr)
-    total_samples = ref.shape[1]
+    if use_museval:
+        scores = compute_museval_fast(ref, test, sr, verbose=verbose)
+        return [{
+            "chunk": "Full Track",
+            "sdr_left": scores["sdr"],
+            "sdr_right": scores["sdr"],
+            "sdr_overall": scores["sdr"],
+            "isr": scores["isr"],
+            "sar": scores["sar"]
+        }]
 
+    # Custom Segmented SDR Pipeline
+    if verbose:
+        print(f"   [SDR] Executing custom segmented SDR across {chunk_sec}s chunks...")
+        
+    chunk_samples = int(chunk_sec * sr)
     chunk_results = []
+    total_chunks = len(range(0, min_len, chunk_samples))
 
-    for start in range(0, total_samples, chunk_samples):
-        end = min(start + chunk_samples, total_samples)
+    for idx, start in enumerate(range(0, min_len, chunk_samples), 1):
+        end = min(start + chunk_samples, min_len)
         if (end - start) < (sr * 0.5):
             continue
 
+        sdr_l = compute_sdr(ref[0, start:end], test[0, start:end])
+        sdr_r = compute_sdr(ref[1, start:end], test[1, start:end])
+        valid = [s for s in (sdr_l, sdr_r) if not np.isnan(s)]
+        overall = np.mean(valid) if valid else np.nan
+
         time_label = f"{start / sr:.1f}s - {end / sr:.1f}s"
-
-        sdr_left = compute_sdr(ref[0, start:end], test[0, start:end])
-        sdr_right = compute_sdr(ref[1, start:end], test[1, start:end])
-
-        valid_scores = [s for s in (sdr_left, sdr_right) if not np.isnan(s)]
-        sdr_overall = np.mean(valid_scores) if valid_scores else np.nan
+        if verbose:
+            print(f"   [SDR Chunk {idx}/{total_chunks}] {time_label} -> Left: {sdr_l:.2f} dB | Right: {sdr_r:.2f} dB | Avg: {overall:.2f} dB")
 
         chunk_results.append({
             "chunk": time_label,
-            "sdr_left": sdr_left,
-            "sdr_right": sdr_right,
-            "sdr_overall": sdr_overall
+            "sdr_left": sdr_l,
+            "sdr_right": sdr_r,
+            "sdr_overall": overall,
+            "isr": np.nan, "sar": np.nan
         })
 
     return chunk_results
 
 
-# -----------------------------------------------------------------------------
-# 5. Reporting & CLI Interface
-# -----------------------------------------------------------------------------
-
-def process_batch(ref_path: str, test_paths: list[str], chunk_sec: float, align: bool):
+def process_batch(ref_path: str, test_paths: list[str], chunk_sec: float, align: bool, use_museval: bool = False, verbose: bool = False):
+    """Executes evaluation over all valid test targets."""
+    print("\n========================================================")
+    print("              LOADING REFERENCE AUDIO                   ")
+    print("========================================================")
+    ref_audio, sr = load_audio(ref_path, verbose=verbose)
     summary_table = []
 
-    for t_path in test_paths:
-        clean_tpath = sanitize_path(t_path)
-        if not validate_file(clean_tpath):
+    print("\n========================================================")
+    print("             STARTING BATCH EVALUATION                  ")
+    print("========================================================")
+    
+    total_files = len(test_paths)
+    batch_start_time = time.time()
+
+    for idx, t_path in enumerate(test_paths, 1):
+        clean_path = sanitize_path(t_path)
+        if not validate_file(clean_path):
             continue
 
-        results = evaluate_track(ref_path, clean_tpath, chunk_duration=chunk_sec, align=align)
+        print(f"\n[Batch Progress: File {idx}/{total_files}]")
+        results = evaluate_track(ref_audio, clean_path, sr, chunk_sec, align, use_museval, verbose=verbose)
 
-        lefts = [r["sdr_left"] for r in results if not np.isnan(r["sdr_left"])]
-        rights = [r["sdr_right"] for r in results if not np.isnan(r["sdr_right"])]
-        overalls = [r["sdr_overall"] for r in results if not np.isnan(r["sdr_overall"])]
+        def safe_mean(key):
+            vals = [r[key] for r in results if np.isfinite(r.get(key, np.nan))]
+            return np.round(np.mean(vals), 2) if vals else "N/A"
+
+        overalls = [r["sdr_overall"] for r in results if np.isfinite(r["sdr_overall"])]
 
         summary_table.append({
-            "File": os.path.basename(clean_tpath),
-            "Mean Left (dB)": np.round(np.mean(lefts), 2) if lefts else "N/A",
-            "Mean Right (dB)": np.round(np.mean(rights), 2) if rights else "N/A",
-            "Overall SDR (dB)": np.round(np.mean(overalls), 2) if overalls else "N/A",
+            "File": os.path.basename(clean_path),
+            "Metric": "Museval BSSEval" if use_museval else "Custom SDR",
+            "Mean Left (dB)": safe_mean("sdr_left"),
+            "Mean Right (dB)": safe_mean("sdr_right"),
+            "Overall SDR (dB)": safe_mean("sdr_overall"),
+            "ISR (dB)": safe_mean("isr"),
+            "SAR (dB)": safe_mean("sar"),
             "_raw_chunks": results,
             "_raw_overall": np.mean(overalls) if overalls else -np.inf
         })
+
+    total_batch_duration = time.time() - batch_start_time
+    print(f"\n[Batch Complete] Evaluated {len(summary_table)} files in {total_batch_duration:.2f} seconds.")
 
     summary_table.sort(key=lambda x: x["_raw_overall"], reverse=True)
     return summary_table
 
 
-def export_csv(summary_data: list[dict], output_csv_path: str):
-    clean_csv_path = sanitize_path(output_csv_path)
-    if not clean_csv_path:
-        return
+# -----------------------------------------------------------------------------
+# Reporting & CLI Entry
+# -----------------------------------------------------------------------------
 
-    # Ensure .csv extension
-    if not clean_csv_path.lower().endswith('.csv'):
-        clean_csv_path += '.csv'
+def export_csv(summary_data: list[dict], output_csv_path: str, verbose: bool = False):
+    """Exports structured results to CSV file."""
+    clean_path = sanitize_path(output_csv_path)
+    if not clean_path.endswith(".csv"):
+        clean_path += ".csv"
 
-    with open(clean_csv_path, mode='w', newline='') as f:
+    if verbose:
+        print(f"\n[Export] Writing evaluation summary to: {clean_path}")
+
+    headers = ["File", "Metric", "Mean Left (dB)", "Mean Right (dB)", "Overall SDR (dB)", "ISR (dB)", "SAR (dB)"]
+
+    with open(clean_path, mode="w", newline="") as f:
         writer = csv.writer(f)
-        # Summary Header
-        writer.writerow(["File", "Mean Left (dB)", "Mean Right (dB)", "Overall SDR (dB)"])
-
-        # Write only the aggregated metrics
+        writer.writerow(headers)
         for item in summary_data:
-            writer.writerow([
-                item["File"],
-                item["Mean Left (dB)"],
-                item["Mean Right (dB)"],
-                item["Overall SDR (dB)"]
-            ])
+            writer.writerow([item[h] for h in headers])
 
-    print(f"\nSummary report successfully exported to: {clean_csv_path}")
+    print(f"Summary successfully exported to: {clean_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate audio stem quality against ground truth reference using SDR.")
+    parser = argparse.ArgumentParser(description="Evaluate audio stem quality against reference audio.")
     parser.add_argument("--ground-truth", "-g", type=str, help="Path to reference audio file")
-    parser.add_argument("--ai", "-a", type=str, nargs="+", help="Path to one or more AI stem audio files or directory")
-    parser.add_argument("--chunk-size", type=float, default=10.0,
-                        help="Window evaluation chunk size in seconds (default: 10.0)")
+    parser.add_argument("--ai", "-a", type=str, nargs="+", help="Path to AI audio files or directory")
+    parser.add_argument("--chunk-size", type=float, default=10.0, help="Chunk window in seconds (default: 10.0)")
     parser.add_argument("--no-align", action="store_true", help="Disable automatic temporal alignment")
     parser.add_argument("--csv", type=str, help="Path to export CSV report")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Print per-chunk breakdown to console")
-
+    parser.add_argument("--verbose", "-v", action="store_true", help="Print per-chunk breakdown and verbose step execution logs")
+    parser.add_argument("--museval", action="store_true", help="Use Museval BSSEval metrics")
     args = parser.parse_args()
 
-    # --- Interactive Inputs with Path Sanitization ---
-    ref_input = args.ground_truth or input("Enter ground-truth reference file path: ")
-    ref_path = sanitize_path(ref_input)
-
+    ref_path = sanitize_path(args.ground_truth or input("Enter ground-truth file path: "))
     if not validate_file(ref_path):
         return
 
-    if not args.ai:
-        ai_input = input("Enter AI stem file or folder path: ")
-        test_inputs = [ai_input]
-    else:
-        test_inputs = args.ai
+    test_inputs = args.ai if args.ai else [input("Enter AI stem file or folder path: ")]
 
-    # Ask for CSV export if in interactive mode and argument wasn't passed
-    csv_target = args.csv
-    if args.csv is None and not args.ground_truth and not args.ai:
-        user_csv = input("Enter CSV export path (press Enter to skip): ")
-        csv_target = sanitize_path(user_csv)
-
-    # Expand directories and sanitize all paths
-    expanded_test_paths = []
+    expanded_paths = []
     for path in test_inputs:
         clean_p = sanitize_path(path)
         if os.path.isdir(clean_p):
             for root, _, files in os.walk(clean_p):
-                for f in files:
-                    if f.lower().endswith(VALID_EXTENSIONS):
-                        expanded_test_paths.append(os.path.join(root, f))
+                expanded_paths.extend([os.path.join(root, f) for f in files if f.lower().endswith(VALID_EXTENSIONS)])
         else:
-            expanded_test_paths.append(clean_p)
+            expanded_paths.append(clean_p)
 
-    if not expanded_test_paths:
+    if not expanded_paths:
         print("[Error] No valid audio files found to test.")
         return
 
-    print("\nProcessing evaluations...")
-    results = process_batch(ref_path, expanded_test_paths, chunk_sec=args.chunk_size, align=not args.no_align)
+    print(f"\nProcessing evaluations using {'Museval BSSEval' if args.museval else 'Custom SDR'}...")
+    results = process_batch(ref_path, expanded_paths, args.chunk_size, not args.no_align, args.museval, verbose=args.verbose)
 
     if args.verbose:
         for item in results:
             print(f"\n--- Detailed Breakdown: {item['File']} ---")
             chunk_table = [[c["chunk"], c["sdr_left"], c["sdr_right"], c["sdr_overall"]] for c in item["_raw_chunks"]]
-            print(tabulate(chunk_table, headers=["Chunk Window", "Left (dB)", "Right (dB)", "Overall (dB)"],
-                           floatfmt=".2f"))
+            print(tabulate(chunk_table, headers=["Chunk Window", "Left (dB)", "Right (dB)", "Overall (dB)"], floatfmt=".2f"))
 
     print("\n=== SDR Evaluation Summary ===")
-    display_summary = [
-        {k: v for k, v in row.items() if not k.startswith("_")}
-        for row in results
-    ]
+    display_summary = [{k: v for k, v in row.items() if not k.startswith("_")} for row in results]
     print(tabulate(display_summary, headers="keys", tablefmt="fancy_grid"))
 
-    # Export if a path was provided and not left blank
-    if csv_target:
-        export_csv(results, csv_target)
+    if args.csv:
+        export_csv(results, args.csv, verbose=args.verbose)
 
 
 if __name__ == "__main__":
